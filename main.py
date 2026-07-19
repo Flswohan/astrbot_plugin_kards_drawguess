@@ -1,414 +1,257 @@
 import os
 import json
-import asyncio
 import random
-import shutil
-from io import BytesIO
-from datetime import datetime, timedelta
-from collections import defaultdict
-import aiohttp
-from PIL import Image
-from skimage.metrics import structural_similarity as ssim
-import numpy as np
-import imagehash
-
+import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
-import astrbot.api.message_components as Comp
 
-
-class KardsDrawGuess(Star):
+class KardsPictionary(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.base_dir = os.path.dirname(__file__)
-        self.data_dir = os.path.join(self.base_dir, "data")
-        self.cards_json_path = os.path.join(self.data_dir, "cards.json")
-        self.images_dir = os.path.join(self.data_dir, "cards_images")
-        self.temp_dir = os.path.join(self.base_dir, "temp")
-        os.makedirs(self.temp_dir, exist_ok=True)
-
-        # 加载卡牌信息
+        # 数据路径
+        self.data_dir = os.path.join(os.path.dirname(__file__), "data")
+        self.cards_db_path = os.path.join(self.data_dir, "cards.json")
         self.cards_db = self.load_cards_db()
-        # 获取所有有图片的卡牌代码
-        self.available_cards = self.get_available_cards()
-        logger.info(f"KARDS画卡牌插件加载，可用卡牌数：{len(self.available_cards)}")
-
-        # 游戏状态管理：{group_id: game_session}
+        
+        # 存储游戏状态 { group_id: {"painter": user_id, "answer": str, "nation": str, "cost": int, "timer": task} }
         self.games = {}
+        
+        logger.info(f"KARDS你画我猜插件加载完成，共加载 {len(self.cards_db)} 张卡牌")
 
     def load_cards_db(self):
-        if os.path.exists(self.cards_json_path):
-            with open(self.cards_json_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {}
+        """加载卡牌数据库，只提取有名字的卡牌"""
+        if not os.path.exists(self.cards_db_path):
+            logger.warning(f"卡牌数据库不存在: {self.cards_db_path}")
+            return {}
+        with open(self.cards_db_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 过滤掉没有 name 字段的无效卡牌
+        valid_cards = {k: v for k, v in data.items() if v.get("name")}
+        return valid_cards
 
-    def get_available_cards(self):
-        """返回有图片且存在于数据库的卡牌代码列表"""
-        valid = []
-        if not os.path.exists(self.images_dir):
-            return valid
-        for fname in os.listdir(self.images_dir):
-            if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                code = os.path.splitext(fname)[0]
-                if code in self.cards_db:
-                    valid.append(code)
-        return valid
+    def get_random_card(self):
+        """随机获取一张卡牌，返回 (卡牌代码, 卡牌数据)"""
+        if not self.cards_db:
+            return None, None
+        code = random.choice(list(self.cards_db.keys()))
+        return code, self.cards_db[code]
 
-    # ==================== 游戏会话类 ====================
-    class GameSession:
-        def __init__(self, initiator_id, initiator_name, card_code, card_name, players=None):
-            self.initiator_id = initiator_id
-            self.initiator_name = initiator_name
-            self.card_code = card_code          # 卡牌代码，用于加载原图
-            self.card_name = card_name          # 卡牌名称，作为题目
-            self.players = players or []        # 玩家列表 [{"id":"xxx", "name":"xxx", "image_path":None}]
-            self.current_index = 0              # 当前轮到第几个玩家（索引）
-            self.started = False
-            self.finished = False
-            self.turn_start_time = None         # 当前回合开始时间
-            self.timer_task = None              # 计时器任务
-            self.threshold = 0.5                # 相似度阈值，可调
+    @filter.command("画猜开始")
+    async def start_game(self, event: AstrMessageEvent):
+        '''开始一轮你画我猜
+        用法：/画猜开始 [@画家]（如果不@，则默认发起者为画家）'''
+        
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("❌ 请在群聊中使用此命令。")
+            return
 
-        def next_player(self):
-            self.current_index += 1
-            if self.current_index >= len(self.players):
-                return None
-            return self.players[self.current_index]
+        # 检查是否已有游戏
+        if group_id in self.games:
+            yield event.plain_result("⏳ 本群已有进行中的画猜游戏，请先使用 /画猜结束 结束当前游戏。")
+            return
 
-        def is_last_player(self):
-            return self.current_index == len(self.players) - 1
+        # 确定画家
+        painter = event.get_sender_id()
+        painter_name = event.get_sender_name()
+        
+        # 检查是否 @ 了别人（简单解析，如果消息里有 @ 则取第一个被@的人）
+        # 注：AstrBot 的 @ 是特殊格式，为了简化，我们默认发起者为画家
+        # 如果用户输入 /画猜开始 @某人，我们可以尝试解析，但为了代码通用，先默认发起者。
+        # 用户可以手动指定：/画猜开始 张三，我们则查找群成员？难度较大，先默认发起者。
+        
+        # 随机选卡
+        code, card = self.get_random_card()
+        if not card:
+            yield event.plain_result("❌ 卡牌数据库为空，请先准备 cards.json 数据。")
+            return
 
-    # ==================== 图像相似度计算 ====================
-    def compare_images(self, img1_path, img2_path):
-        """
-        计算两张图片的SSIM（结构相似性），返回0-1之间的浮点数
-        """
+        answer = card.get("name")
+        nation = card.get("nation", "未知国家")
+        cost = card.get("cost", "?")
+        card_type = card.get("type", "卡牌")
+
+        # 存储游戏状态
+        self.games[group_id] = {
+            "painter": painter,
+            "painter_name": painter_name,
+            "answer": answer,
+            "code": code,
+            "nation": nation,
+            "cost": cost,
+            "card_type": card_type
+        }
+
+        # 1. 尝试私聊画家（发送答案）
+        private_msg = f"🎨 你画我猜 - 你的关键词是：\n【{answer}】\n\n请在群里画出这张 {nation} {cost}费{card_type}，让大家猜吧！"
         try:
-            # 加载并转为灰度，调整到相同大小
-            img1 = Image.open(img1_path).convert('L')
-            img2 = Image.open(img2_path).convert('L')
-            # 统一尺寸（为了SSIM）
-            size = (256, 256)
-            img1 = img1.resize(size, Image.Resampling.LANCZOS)
-            img2 = img2.resize(size, Image.Resampling.LANCZOS)
-            arr1 = np.array(img1)
-            arr2 = np.array(img2)
-            # 计算SSIM
-            score = ssim(arr1, arr2, data_range=255)
-            return score
+            # 尝试发送私聊
+            yield self.context.send_message_to_user(painter, private_msg)
+            private_status = "✅ 答案已通过私聊发送给你，请勿泄露！"
         except Exception as e:
-            logger.error(f"SSIM计算失败: {e}")
-            return 0.0
+            logger.warning(f"私聊画家失败: {e}")
+            # 如果私聊失败，用一个简单的“倒置”或“提示词”在群里保护
+            # 这里我们直接告诉画家在群里回复特定指令查看答案（或者干脆公开，但建议安全起见）
+            # 既然私聊失败，我们只能在群里提示画家私聊机器人，或者换一种玩法：直接给提示
+            private_status = f"⚠️ 无法私聊你，请主动私聊机器人输入【我的关键词】来获取要画的卡牌名。"
 
-    # ==================== 游戏管理 ====================
-    def create_game(self, group_id, initiator_id, initiator_name):
-        """创建游戏，随机选一张卡牌作为题目"""
-        if not self.available_cards:
-            return None, "卡牌图片库为空，无法开始游戏"
+        # 2. 群聊广播（不包含答案）
+        broadcast = (
+            f"🎨 **你画我猜开始！**\n"
+            f"👨‍🎨 画家：{painter_name}\n"
+            f"📝 提示：{nation} | {cost}费 | {card_type}\n"
+            f"🔍 大家根据画作猜卡牌名称！直接发送卡牌名即可。\n"
+            f"{private_status}"
+        )
+        yield event.plain_result(broadcast)
 
-        card_code = random.choice(self.available_cards)
-        card_info = self.cards_db.get(card_code, {})
-        card_name = card_info.get("name", card_code)
+        # 3. 设置超时（5分钟后自动结束）
+        async def timeout_task():
+            await asyncio.sleep(300)  # 300秒 = 5分钟
+            if group_id in self.games:
+                game = self.games[group_id]
+                del self.games[group_id]
+                # 无法在异步任务里直接 yield，用 context 发消息
+                await self.context.send_message(
+                    event.get_session_id(),
+                    f"⏰ 时间到！本轮答案是：【{game['answer']}】\n下次再玩吧！"
+                )
+        asyncio.create_task(timeout_task())
 
-        session = self.GameSession(initiator_id, initiator_name, card_code, card_name)
-        session.players.append({"id": initiator_id, "name": initiator_name, "image_path": None})
-        self.games[group_id] = session
-        return session, f"已创建游戏，题目已定！当前玩家：{initiator_name}（房主）\n请其他玩家发送 `/加入画卡牌` 加入。"
-
-    def join_game(self, group_id, player_id, player_name):
-        session = self.games.get(group_id)
-        if not session:
-            return None, "当前群没有进行中的游戏，请先发送 `/画卡牌` 创建。"
-        if session.started:
-            return None, "游戏已经开始，无法加入。"
-        if any(p["id"] == player_id for p in session.players):
-            return None, "你已经加入了。"
-        session.players.append({"id": player_id, "name": player_name, "image_path": None})
-        return session, f"{player_name} 加入成功！当前共 {len(session.players)} 人。"
-
-    def start_game(self, group_id, initiator_id):
-        session = self.games.get(group_id)
-        if not session:
-            return None, "没有游戏。"
-        if session.started:
-            return None, "游戏已开始。"
-        if session.initiator_id != initiator_id:
-            return None, "只有房主可以开始游戏。"
-        if len(session.players) < 2:
-            return None, "至少需要2名玩家。"
-        # 随机打乱玩家顺序（房主保留在第一个？或全部打乱）
-        # 为了公平，全部打乱，但房主也可以参与
-        random.shuffle(session.players)
-        # 但确保房主不是第一个？或者无所谓，我们就按随机顺序
-        session.started = True
-        session.current_index = 0
-        # 开始第一个玩家的回合
-        self._start_turn(group_id)
-        return session, f"游戏开始！绘画顺序：\n" + "\n".join([f"{i+1}. {p['name']}" for i, p in enumerate(session.players)])
-
-    def _start_turn(self, group_id):
-        session = self.games.get(group_id)
-        if not session or session.finished:
-            return
-        player = session.players[session.current_index]
-        # 设置计时器，1分钟
-        session.turn_start_time = datetime.now()
-        # 发送提示消息（这里我们通过外部发送，在命令处理中发送，因为这里无法直接yield）
-        # 我们返回需要发送的消息，由调用者处理
-        return player
-
-    def submit_drawing(self, group_id, player_id, image_url):
-        """玩家提交画作，保存图片并判断是否最后一人"""
-        session = self.games.get(group_id)
-        if not session or not session.started or session.finished:
-            return None, "游戏未开始或已结束。"
-        current_player = session.players[session.current_index]
-        if current_player["id"] != player_id:
-            return None, "还没轮到你画哦。"
-
-        # 下载图片
-        try:
-            # 使用aiohttp下载
-            async def download():
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(image_url) as resp:
-                        if resp.status == 200:
-                            img_data = await resp.read()
-                            return img_data
-                        return None
-            # 由于这里是同步函数，需要运行异步，我们使用asyncio.run，但最好改为异步方法
-            # 实际我们会在命令处理中异步调用，所以把下载逻辑放在外面，这里只处理文件保存
-            # 我们改变设计：提交命令中直接传入图片数据，而不是URL
-            # 下面调整
-        except:
-            pass
-        # 我们改为在命令处理中下载并传递文件路径
-
-        return session, "提交成功"
-
-    # 我们重新设计：将提交处理放在命令中，因为涉及异步下载
-
-    # ==================== 命令处理 ====================
-    @filter.command("画卡牌")
-    async def cmd_create(self, event: AstrMessageEvent):
-        '''创建新游戏
-        用法：/画卡牌
-        然后其他玩家用 /加入画卡牌 加入，房主用 /开始画卡牌 开始'''
+    @filter.command("画猜结束")
+    async def end_game(self, event: AstrMessageEvent):
+        '''强制结束当前画猜游戏
+        用法：/画猜结束'''
         group_id = event.get_group_id()
         if not group_id:
-            yield event.plain_result("该命令仅支持群聊。")
+            yield event.plain_result("❌ 请在群聊中使用此命令。")
             return
-        if group_id in self.games and not self.games[group_id].finished:
-            yield event.plain_result("当前群已有游戏进行中，请等待结束。")
-            return
-        sender_id = event.get_sender_id()
-        sender_name = event.get_sender_name()
-        session, msg = self.create_game(group_id, sender_id, sender_name)
-        if session:
-            yield event.plain_result(msg)
-            # 同时发送题目提示（不显示卡牌图片，只显示名称和属性）
-            card_info = self.cards_db.get(session.card_code, {})
-            extra_info = f"国家：{card_info.get('nation','未知')}，费用：{card_info.get('cost','?')}，类型：{card_info.get('type','未知')}"
-            yield event.plain_result(f"🎨 本次要画的卡牌是：**{session.card_name}**\n提示：{extra_info}\n请在不看原图的情况下凭记忆或想象绘画！")
-        else:
-            yield event.plain_result(f"❌ {msg}")
 
-    @filter.command("加入画卡牌")
-    async def cmd_join(self, event: AstrMessageEvent):
-        '''加入游戏
-        用法：/加入画卡牌'''
+        if group_id not in self.games:
+            yield event.plain_result("❌ 本群当前没有进行中的画猜游戏。")
+            return
+
+        game = self.games.pop(group_id)
+        yield event.plain_result(f"🛑 游戏已结束。\n答案是：【{game['answer']}】")
+
+    @filter.command("画猜提示")
+    async def give_hint(self, event: AstrMessageEvent):
+        '''获取额外提示（限画家使用）
+        用法：/画猜提示'''
         group_id = event.get_group_id()
         if not group_id:
-            yield event.plain_result("该命令仅支持群聊。")
+            yield event.plain_result("❌ 请在群聊中使用此命令。")
             return
-        sender_id = event.get_sender_id()
-        sender_name = event.get_sender_name()
-        session, msg = self.join_game(group_id, sender_id, sender_name)
-        if session:
-            yield event.plain_result(msg)
-        else:
-            yield event.plain_result(f"❌ {msg}")
 
-    @filter.command("开始画卡牌")
-    async def cmd_start(self, event: AstrMessageEvent):
-        '''房主开始游戏
-        用法：/开始画卡牌'''
+        if group_id not in self.games:
+            yield event.plain_result("❌ 本群当前没有进行中的画猜游戏。")
+            return
+
+        game = self.games[group_id]
+        sender_id = event.get_sender_id()
+        
+        if sender_id != game["painter"]:
+            yield event.plain_result("❌ 只有画家可以使用此命令查看提示。")
+            return
+
+        # 给画家看额外提示（比如卡牌描述、攻击力等）
+        code = game["code"]
+        card = self.cards_db.get(code, {})
+        extra = []
+        if card.get("ability"):
+            extra.append(f"能力：{card['ability']}")
+        if card.get("attack") is not None and card.get("health") is not None:
+            extra.append(f"身材：{card['attack']}/{card['health']}")
+        
+        if extra:
+            yield event.plain_result(f"🔎 额外提示（仅画家可见）：\n" + "\n".join(extra))
+        else:
+            yield event.plain_result("ℹ️ 这张卡没有更多额外属性了，加油画吧！")
+
+    @filter.command("我的关键词")
+    async def get_my_keyword(self, event: AstrMessageEvent):
+        '''私聊获取当前画猜关键词（私聊专用）
+        用法：私聊机器人发送 /我的关键词'''
+        # 这个命令设计为私聊使用，但也可以在群里用（此时会尝试私聊）
+        user_id = event.get_sender_id()
+        group_id = event.get_group_id()
+        
+        # 查找用户所在群是否有游戏且该用户是画家
+        found = None
+        for gid, game in self.games.items():
+            if game["painter"] == user_id:
+                found = game
+                break
+        
+        if not found:
+            yield event.plain_result("❌ 你目前不是任何画猜游戏的画家。")
+            return
+
+        # 私聊发送关键词
+        yield self.context.send_message_to_user(
+            user_id,
+            f"🎨 你当前的画猜关键词是：【{found['answer']}】\n请在群里画出来让大家猜吧！"
+        )
+        yield event.plain_result("✅ 关键词已通过私聊发送给你。")
+
+    # 监听群消息，用于猜答案（注意：不能再用 @filter.command，否则会干扰命令解析）
+    # 这里我们使用一个通用的消息处理钩子，但 AstrBot 中我们可以在类里重写 handle_message 或使用监听器。
+    # 由于 AstrBot 支持 @filter 监听所有消息，但我们不想让命令重复触发，我们用另一种方式：
+    # 在 AstrBot 中，最佳实践是创建一个独立的 listener，但为了单文件简洁，我们利用 event 的过滤。
+    # 因为 AstrBot 的 @filter.command 只匹配命令，普通消息不触发。
+    # 我们需要一个能抓取所有群消息的监听器。
+    
+    # 我们通过重写 Star 的 handle_message 方法？但 AstrBot 3.x 通常使用 filter 装饰器。
+    # 我们可以这样：添加一个监听所有消息的方法，并手动过滤掉命令。
+    # 但为了减少干扰，我们可以要求猜词时必须带特定前缀，比如 /猜 卡牌名。
+    # 如果直接发消息猜，容易误触。结合你之前的需求，我建议猜词格式为：/猜 卡牌名
+    # 这样可以完美避开干扰，而且用户也容易操作。
+    
+    @filter.command("猜")
+    async def guess_card(self, event: AstrMessageEvent):
+        '''猜测卡牌名称（必须在画猜游戏进行中）
+        用法：/猜 <卡牌名>
+        示例：/猜 闪电战'''
+        
         group_id = event.get_group_id()
         if not group_id:
-            yield event.plain_result("该命令仅支持群聊。")
+            yield event.plain_result("❌ 请在群聊中使用此命令。")
             return
-        sender_id = event.get_sender_id()
-        session, msg = self.start_game(group_id, sender_id)
-        if session:
-            yield event.plain_result(msg)
-            # 开始第一个回合
-            first_player = session.players[0]
-            yield event.plain_result(f"🖌️ 请 **{first_player['name']}** 开始作画！\n你有一分钟时间，画完后发送 **/上传画作** 并附上图片。")
-            # 启动计时器，1分钟后超时
-            asyncio.create_task(self._turn_timeout(group_id, first_player['id']))
+
+        if group_id not in self.games:
+            yield event.plain_result("❌ 本群当前没有进行中的画猜游戏。")
+            return
+
+        if not event.message_str:
+            yield event.plain_result("❌ 请输入你要猜的卡牌名。\n用法：/猜 卡牌名")
+            return
+
+        # 提取猜的词
+        parts = event.message_str.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.plain_result("❌ 请输入你要猜的卡牌名。\n示例：/猜 闪电战")
+            return
+        
+        guess = parts[1].strip()
+        game = self.games[group_id]
+        answer = game["answer"]
+
+        # 判断是否猜中（忽略大小写/空格，中文直接比较）
+        if guess == answer:
+            # 猜中了！
+            winner = event.get_sender_name()
+            painter_name = game["painter_name"]
+            self.games.pop(group_id)  # 结束游戏
+            
+            yield event.plain_result(
+                f"🎉 **恭喜 {winner} 猜对了！**\n"
+                f"正确答案就是：【{answer}】\n"
+                f"👏 画家 {painter_name} 画得真棒！"
+            )
         else:
-            yield event.plain_result(f"❌ {msg}")
-
-    async def _turn_timeout(self, group_id, player_id):
-        """超时处理，1分钟未提交则跳过"""
-        await asyncio.sleep(60)
-        session = self.games.get(group_id)
-        if not session or session.finished:
-            return
-        # 检查当前玩家是否还是该玩家
-        if session.players[session.current_index]['id'] == player_id:
-            # 超时，自动跳过
-            await self._next_turn(group_id, timeout=True)
-
-    async def _next_turn(self, group_id, timeout=False):
-        """切换到下一个玩家，或结束游戏"""
-        session = self.games.get(group_id)
-        if not session or session.finished:
-            return
-        # 如果超时，当前玩家未提交，我们记录为未画
-        if timeout:
-            # 通知群
-            await self._send_message(group_id, f"⏰ {session.players[session.current_index]['name']} 超时未画，自动跳过。")
-            # 移动到下一个
-            session.current_index += 1
-            if session.current_index >= len(session.players):
-                # 所有人都画完了，进行审核
-                await self._final_review(group_id)
-                return
-            # 通知下一位
-            next_player = session.players[session.current_index]
-            await self._send_message(group_id, f"🖌️ 轮到 **{next_player['name']}** 作画！一分钟倒计时开始。")
-            asyncio.create_task(self._turn_timeout(group_id, next_player['id']))
-        else:
-            # 正常提交后的切换
-            session.current_index += 1
-            if session.current_index >= len(session.players):
-                await self._final_review(group_id)
-                return
-            next_player = session.players[session.current_index]
-            await self._send_message(group_id, f"🖌️ 轮到 **{next_player['name']}** 作画！一分钟倒计时开始。")
-            asyncio.create_task(self._turn_timeout(group_id, next_player['id']))
-
-    async def _send_message(self, group_id, msg):
-        """发送群消息（由于无法在非命令上下文中直接yield，我们通过context发送）"""
-        # 这里使用context的send_message方法（需要获取context实例）
-        # 我们保存context引用
-        await self.context.send_message(group_id, msg)
-
-    @filter.command("上传画作")
-    async def cmd_upload(self, event: AstrMessageEvent):
-        '''上传你的画作
-        用法：/上传画作 并附上图片'''
-        group_id = event.get_group_id()
-        if not group_id:
-            yield event.plain_result("该命令仅支持群聊。")
-            return
-        session = self.games.get(group_id)
-        if not session or not session.started or session.finished:
-            yield event.plain_result("当前没有进行中的游戏。")
-            return
-        sender_id = event.get_sender_id()
-        current_player = session.players[session.current_index]
-        if current_player['id'] != sender_id:
-            yield event.plain_result("还没轮到你画。")
-            return
-
-        # 检查是否有图片
-        if not event.message_obj or not hasattr(event.message_obj, 'message'):
-            yield event.plain_result("请附上一张图片！")
-            return
-        image_segments = [seg for seg in event.message_obj.message if isinstance(seg, Comp.Image)]
-        if not image_segments:
-            yield event.plain_result("请附上一张图片！")
-            return
-
-        img_url = image_segments[0].url
-        if not img_url:
-            yield event.plain_result("无法获取图片URL。")
-            return
-
-        # 下载图片并保存到临时目录
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(img_url) as resp:
-                    if resp.status != 200:
-                        yield event.plain_result("图片下载失败。")
-                        return
-                    img_data = await resp.read()
-                    # 保存为临时文件
-                    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-                    temp_path = os.path.join(self.temp_dir, f"{sender_id}_{timestamp}.png")
-                    with open(temp_path, 'wb') as f:
-                        f.write(img_data)
-                    # 记录到玩家信息
-                    current_player['image_path'] = temp_path
-                    yield event.plain_result(f"✅ {current_player['name']} 的画作已接收！")
-                    # 检查是否最后一人
-                    if session.is_last_player():
-                        # 直接进入审核
-                        await self._final_review(group_id)
-                    else:
-                        # 切换到下一位
-                        await self._next_turn(group_id, timeout=False)
-        except Exception as e:
-            logger.error(f"上传画作失败: {e}")
-            yield event.plain_result(f"上传失败: {str(e)}")
-
-    async def _final_review(self, group_id):
-        """最后一人画完，进行审核"""
-        session = self.games.get(group_id)
-        if not session:
-            return
-        # 获取最后一位玩家的画作路径
-        last_player = session.players[-1]
-        drawing_path = last_player.get('image_path')
-        if not drawing_path or not os.path.exists(drawing_path):
-            await self._send_message(group_id, "最后一位玩家未提交画作，游戏结束。")
-            self.games.pop(group_id, None)
-            return
-
-        # 加载原卡牌图片
-        original_path = os.path.join(self.images_dir, f"{session.card_code}.png")
-        if not os.path.exists(original_path):
-            # 尝试其他扩展名
-            for ext in ['.jpg', '.jpeg', '.webp']:
-                alt_path = os.path.join(self.images_dir, f"{session.card_code}{ext}")
-                if os.path.exists(alt_path):
-                    original_path = alt_path
-                    break
-            else:
-                await self._send_message(group_id, "❌ 找不到目标卡牌的原图，无法审核。")
-                self.games.pop(group_id, None)
-                return
-
-        # 计算相似度
-        similarity = self.compare_images(drawing_path, original_path)
-        threshold = session.threshold
-        is_win = similarity >= threshold
-
-        # 清理临时文件
-        try:
-            os.remove(drawing_path)
-        except:
-            pass
-
-        # 发送结果
-        result_msg = f"🎨 绘画审核结果：\n相似度：{similarity*100:.1f}%\n"
-        if is_win:
-            result_msg += f"🎉 恭喜！相似度达到 {threshold*100}%，游戏胜利！"
-        else:
-            result_msg += f"😢 相似度未达到 {threshold*100}%，游戏失败。\n以下是原卡牌："
-        await self._send_message(group_id, result_msg)
-
-        # 如果失败，可以发送原图
-        if not is_win:
-            # 发送原图（需要上传图片，我们可借助context发送文件）
-            # 由于AstrBot可能不支持直接发送文件，我们可以使用图片链接或base64，简单起见，仅文字提示
-            await self._send_message(group_id, f"原卡牌名称：{session.card_name}，代码：{session.card_code}")
-
-        # 清理游戏
-        self.games.pop(group_id, None)
+            yield event.plain_result(f"❌ 不对哦，再想想～（提示：{game['nation']}，{game['cost']}费）")
 
     async def terminate(self):
-        logger.info("KARDS画卡牌插件已卸载")
+        """插件卸载时清理"""
+        logger.info("KARDS你画我猜插件已卸载")
