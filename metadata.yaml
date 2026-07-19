@@ -1,7 +1,7 @@
-name: astrbot_plugin_kards_drawguess
-display_name: KARDS画卡牌
-short_desc: 多人接力你画我猜，画KARDS卡牌
-desc: 群内多人轮流画同一张卡牌，最后根据画作相似度判定胜负
+name: astrbot_plugin_kards_pictionary
+display_name: KARDS你画我猜
+short_desc: 指定KARDS卡牌让你画我猜
+desc: 机器人随机抽取KARDS卡牌，私聊告诉画家，群内猜卡牌名称
 author: 你的名字
 version: 1.0.0
 astrbot_version: ">=3.0.0"
